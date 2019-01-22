@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2017 Google Inc.
+ * Copyright 2018 Google Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,281 +14,144 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-'use strict';
 
-// See https://github.com/GoogleChromeLabs/preload-webpack-plugin/issues/45
-require('object.values').shim();
+const assert = require('assert');
 
-const objectAssign = require('object-assign');
-
-const PLUGIN_NAME = 'preload-webpack-plugin';
-
-const weblog = require('webpack-log');
-const log = weblog({name: PLUGIN_NAME});
-
-const flatten = arr => arr.reduce((prev, curr) => prev.concat(curr), []);
-
-const doesChunkBelongToHTML = (chunk, roots, visitedChunks) => {
-  // Prevent circular recursion.
-  // See https://github.com/GoogleChromeLabs/preload-webpack-plugin/issues/49
-  if (visitedChunks[chunk.renderedHash]) {
-    return false;
-  }
-  visitedChunks[chunk.renderedHash] = true;
-
-  for (const root of roots) {
-    if (root.hash === chunk.renderedHash) {
-      return true;
-    }
-  }
-
-  for (const parent of chunk.parents) {
-    if (doesChunkBelongToHTML(parent, roots, visitedChunks)) {
-      return true;
-    }
-  }
-
-  return false;
-};
-
-const doesChunkGroupBelongToHTML = (chunkGroup, rootChunkGroups, visitedChunks) => {
-  // Prevent circular recursion.
-  // See https://github.com/GoogleChromeLabs/preload-webpack-plugin/issues/49
-  if (visitedChunks[chunkGroup.groupDebugId]) {
-    return false;
-  }
-  visitedChunks[chunkGroup.groupDebugId] = true;
-
-  for (const rootChunkGroup of rootChunkGroups) {
-    if (rootChunkGroup.groupDebugId === chunkGroup.groupDebugId) {
-      return true;
-    }
-  }
-
-  for (const parentChunkGroup of chunkGroup.getParents()) {
-    if (doesChunkGroupBelongToHTML(parentChunkGroup, rootChunkGroups, visitedChunks)) {
-      return true;
-    }
-  }
-
-  return false;
-};
-
-const defaultOptions = {
-  rel: 'preload',
-  include: 'asyncChunks',
-  fileBlacklist: [/\.map/],
-  excludeHtmlNames: [],
-};
+const createHTMLElementString = require('./lib/create-html-element-string');
+const defaultOptions = require('./lib/default-options');
+const determineAsValue = require('./lib/determine-as-value');
+const doesChunkBelongToHTML = require('./lib/does-chunk-belong-to-html');
+const extractChunks = require('./lib/extract-chunks');
+const insertLinksIntoHead = require('./lib/insert-links-into-head');
 
 class PreloadPlugin {
   constructor(options) {
-    this.options = objectAssign({}, defaultOptions, options);
+    this.options = Object.assign({}, defaultOptions, options);
+  }
+
+  addLinks(webpackVersion, compilation, htmlPluginData) {
+    assert(webpackVersion in doesChunkBelongToHTML,
+      `An invalid webpackVersion was supplied. Supported values: ${Object.keys(doesChunkBelongToHTML)}.`);
+
+    const options = this.options;
+
+    // Bail out early if we're configured to exclude this HTML file.
+    if (options.excludeHtmlNames.includes(htmlPluginData.plugin.options.filename)) {
+      return htmlPluginData;
+    }
+
+    const extractedChunks = extractChunks({
+      compilation,
+      optionsInclude: options.include,
+    });
+
+    const htmlChunks = options.include === 'allAssets' ?
+      // Handle all chunks.
+      extractedChunks :
+      // Only handle chunks imported by this HtmlWebpackPlugin.
+      extractedChunks.filter((chunk) => doesChunkBelongToHTML[webpackVersion]({
+        chunk,
+        compilation,
+        htmlAssetsChunks: Object.values(htmlPluginData.assets.chunks),
+      }));
+
+    // Flatten the list of files.
+    const allFiles = htmlChunks.reduce((accumulated, chunk) => {
+      return accumulated.concat(chunk.files);
+    }, []);
+    const uniqueFiles = new Set(allFiles);
+    const filteredFiles = [...uniqueFiles].filter(file => {
+      return (
+        !this.options.fileWhitelist ||
+        this.options.fileWhitelist.some(regex => regex.test(file))
+      );
+    }).filter(file => {
+      return (
+        !this.options.fileBlacklist ||
+        this.options.fileBlacklist.every(regex => !regex.test(file))
+      );
+    });
+    // Sort to ensure the output is predictable.
+    const sortedFilteredFiles = filteredFiles.sort();
+
+    const links = [];
+    const publicPath = compilation.outputOptions.publicPath || '';
+    for (const file of sortedFilteredFiles) {
+      const href = `${publicPath}${file}`;
+
+      const attributes = {
+        href,
+        rel: options.rel,
+        onload: "this.rel='stylesheet'"
+      };
+
+      // If we're preloading this resource (as opposed to prefetching),
+      // then we need to set the 'as' attribute correctly.
+      if (options.rel === 'preload') {
+        attributes.as = determineAsValue({
+          href,
+          optionsAs: options.as,
+        });
+
+        // On the off chance that we have a cross-origin 'href' attribute,
+        // set crossOrigin on the <link> to trigger CORS mode. Non-CORS
+        // fonts can't be used.
+        if (attributes.as === 'font') {
+          attributes.crossorigin = '';
+        }
+      }
+
+      const linkElementString = createHTMLElementString({
+        attributes,
+        elementName: 'link',
+      });
+      links.push(linkElementString);
+    }
+
+    htmlPluginData.html = insertLinksIntoHead({
+      links,
+      html: htmlPluginData.html,
+    });
+
+    return htmlPluginData;
   }
 
   apply(compiler) {
-    this.beforeV4 = !compiler.hooks;
-    if (this.beforeV4) {
-      compiler.plugin('compilation', this.pluginHandler.bind(this));
-    } else {
-      compiler.hooks['compilation'].tap(PLUGIN_NAME, this.hooksHandler.bind(this));
-    }
-  }
-
-  // handler use for webpack v4
-  hooksHandler(compilation) {
-    if (!compilation.hooks.htmlWebpackPluginAfterHtmlProcessing) {
-      const message = `compilation.hooks.htmlWebpackPluginAfterHtmlProcessing is lost.
-      Please make sure you have installed html-webpack-plugin and put it before ${PLUGIN_NAME}`;
-      log.error(message);
-      throw new Error(message);
-    }
-    compilation.hooks.htmlWebpackPluginAfterHtmlProcessing
-      .tapAsync(PLUGIN_NAME, (htmlPluginData, cb) => this.afterHtmlProcessingFn(htmlPluginData, cb, compilation));
-  }
-
-  // handler use before webpack v4
-  pluginHandler(compilation) {
-    compilation.plugin('html-webpack-plugin-before-html-processing', (htmlPluginData, cb) => {
-      this.afterHtmlProcessingFn(htmlPluginData, cb, compilation);
-    });
-  }
-
-  afterHtmlProcessingFn(htmlPluginData, cb, compilation) {
-    if (this.options.excludeHtmlNames.indexOf(htmlPluginData.plugin.options.filename) > -1) {
-      cb(null, htmlPluginData);
-      return;
-    }
-
-    const extractedChunks = this.beforeV4
-      ? this.extractedChunksByChunk(htmlPluginData, compilation)
-      : this.extractedChunksByChunkGroup(htmlPluginData, compilation);
-
-    this.addLinksBasedOnChunks(extractedChunks, compilation, htmlPluginData, cb);
-  }
-
-  extractedChunksByChunkGroup(htmlPluginData, compilation) {
-    const options = this.options;
-    let extractedChunks = [];
-    const initialChunkGroups = compilation.chunkGroups.filter(chunkGroup => chunkGroup.isInitial());
-    const initialChunks = initialChunkGroups.reduce((initialChunks, {chunks}) => {
-      return initialChunks.concat(chunks);
-    }, []);
-    // 'asyncChunks' are chunks intended for lazy/async loading usually generated as
-    // part of code-splitting with import() or require.ensure(). By default, asyncChunks
-    // get wired up using link rel=preload when using this plugin. This behaviour can be
-    // configured to preload all types of chunks or just prefetch chunks as needed.
-    if (options.include === undefined || options.include === 'asyncChunks') {
-      extractedChunks = compilation.chunks.filter(chunk => {
-        return initialChunks.indexOf(chunk) < 0;
-      });
-    } else if (options.include === 'initial') {
-      extractedChunks = compilation.chunks.filter(chunk => {
-        return initialChunks.indexOf(chunk) > -1;
-      });
-    } else if (options.include === 'allChunks' || options.include === 'all') {
-      if (options.include === 'all') {
-        /* eslint-disable no-console */
-        console.warn('[WARNING]: { include: "all" } is deprecated, please use "allChunks" instead.');
-        /* eslint-enable no-console */
-      }
-      // Async chunks, vendor chunks, normal chunks.
-      extractedChunks = compilation.chunks;
-    } else if (options.include === 'allAssets') {
-      extractedChunks = [{files: Object.keys(compilation.assets)}];
-    } else if (Array.isArray(options.include)) {
-      // Keep only user specified chunks
-      extractedChunks = compilation.chunks
-        .filter((chunk) => {
-          const chunkName = chunk.name;
-          // Works only for named chunks
-          if (!chunkName) {
-            return false;
-          }
-          return options.include.indexOf(chunkName) > -1;
-        });
-    }
-
-    // only handle the chunks associated to this htmlWebpackPlugin instance, in case of multiple html plugin outputs
-    // allow `allAssets` mode to skip, as assets are just files to be filtered by black/whitelist, not real chunks
-    if (options.include !== 'allAssets') {
-      extractedChunks = extractedChunks.filter(chunk => {
-        const rootChunksHashs = Object.values(htmlPluginData.assets.chunks).map(({hash}) => hash);
-        const rootChunkGroups = compilation.chunkGroups.reduce((groups, chunkGroup) => {
-          const isRootChunkGroup = chunkGroup.chunks.reduce((flag, chunk) => {
-            return flag ||
-              rootChunksHashs.indexOf(chunk.renderedHash) > -1;
-          }, false);
-          if (isRootChunkGroup) groups.push(chunkGroup);
-          return groups;
-        }, []);
-        return Array.from(chunk.groupsIterable).reduce((flag, chunkGroup) => {
-          return flag ||
-            doesChunkGroupBelongToHTML(chunkGroup, rootChunkGroups, {});
-        }, false);
-      });
-    }
-
-    return extractedChunks;
-  }
-
-  extractedChunksByChunk(htmlPluginData, compilation) {
-    const options = this.options;
-    let extractedChunks = [];
-    // 'asyncChunks' are chunks intended for lazy/async loading usually generated as
-    // part of code-splitting with import() or require.ensure(). By default, asyncChunks
-    // get wired up using link rel=preload when using this plugin. This behaviour can be
-    // configured to preload all types of chunks or just prefetch chunks as needed.
-    if (options.include === undefined || options.include === 'asyncChunks') {
-      try {
-        extractedChunks = compilation.chunks.filter(chunk => !chunk.isInitial());
-      } catch (e) {
-        extractedChunks = compilation.chunks;
-      }
-    } else if (options.include === 'initial') {
-      try {
-        extractedChunks = compilation.chunks.filter(chunk => chunk.isInitial());
-      } catch (e) {
-        extractedChunks = compilation.chunks;
-      }
-    } else if (options.include === 'allChunks' || options.include === 'all') {
-      if (options.include === 'all') {
-        /* eslint-disable no-console */
-        console.warn('[WARNING]: { include: "all" } is deprecated, please use "allChunks" instead.');
-        /* eslint-enable no-console */
-      }
-      // Async chunks, vendor chunks, normal chunks.
-      extractedChunks = compilation.chunks;
-    } else if (options.include === 'allAssets') {
-      extractedChunks = [{files: Object.keys(compilation.assets)}];
-    } else if (Array.isArray(options.include)) {
-      // Keep only user specified chunks
-      extractedChunks = compilation
-        .chunks
-        .filter((chunk) => {
-          const chunkName = chunk.name;
-          // Works only for named chunks
-          if (!chunkName) {
-            return false;
-          }
-          return options.include.indexOf(chunkName) > -1;
-        });
-    }
-
-    // only handle the chunks associated to this htmlWebpackPlugin instance, in case of multiple html plugin outputs
-    // allow `allAssets` mode to skip, as assets are just files to be filtered by black/whitelist, not real chunks
-    if (options.include !== 'allAssets') {
-      extractedChunks = extractedChunks.filter(chunk => doesChunkBelongToHTML(
-        chunk, Object.values(htmlPluginData.assets.chunks), {}));
-    }
-    return extractedChunks;
-  }
-
-  addLinksBasedOnChunks(extractedChunks, compilation, htmlPluginData, cb) {
-    const options = this.options;
-    let filesToInclude = '';
-    const publicPath = compilation.outputOptions.publicPath || '';
-    flatten(extractedChunks.map(chunk => chunk.files))
-      .filter(entry => {
-        return (
-          !this.options.fileWhitelist ||
-          this.options.fileWhitelist.some(regex => regex.test(entry) === true)
-        );
-      })
-      .filter(entry => {
-        return this.options.fileBlacklist.every(regex => regex.test(entry) === false);
-      }).forEach(entry => {
-        entry = `${publicPath}${entry}`;
-        if (options.rel === 'preload') {
-          // If `as` value is not provided in option, dynamically determine the correct
-          // value depends on suffix of filename. Otherwise use the given `as` value.
-          let asValue;
-          if (!options.as) {
-            if (entry.match(/\.css$/)) asValue = 'style';
-            else if (entry.match(/\.woff2$/)) asValue = 'font';
-            else asValue = 'script';
-          } else if (typeof options.as === 'function') {
-            asValue = options.as(entry);
+    if ('hooks' in compiler) {
+      compiler.hooks.compilation.tap(
+        this.constructor.name,
+        compilation => {
+          if ('htmlWebpackPluginBeforeHtmlProcessing' in compilation.hooks) {
+            compilation.hooks.htmlWebpackPluginBeforeHtmlProcessing.tapAsync(
+              this.constructor.name,
+              (htmlPluginData, callback) => {
+                try {
+                  callback(null, this.addLinks('v4', compilation, htmlPluginData));
+                } catch (error) {
+                  callback(error);
+                }
+              }
+            );
           } else {
-            asValue = options.as;
+            const error = new Error(`Unable to tap into the ` +
+              `HtmlWebpackPlugin's callbacks. Make sure to list ` +
+              `${this.constructor.name} at some point after ` +
+              `HtmlWebpackPlugin in webpack's plugins array.`);
+            compilation.errors.push(error);
           }
-          const crossOrigin = asValue === 'font' ? 'crossorigin="crossorigin" ' : '';
-          filesToInclude+= `<link rel="${options.rel}" as="${asValue}" ${crossOrigin}href="${entry}">\n`;
-        } else {
-          // If preload isn't specified, the only other valid entry is prefetch here
-          // You could specify preconnect but as we're dealing with direct paths to resources
-          // instead of origins that would make less sense.
-          filesToInclude+= `<link rel="${options.rel}" href="${entry}">\n`;
         }
-      });
-    if (htmlPluginData.html.indexOf('</head>') !== -1) {
-      // If a valid closing </head> is found, update it to include preload/prefetch tags
-      htmlPluginData.html = htmlPluginData.html.replace('</head>', filesToInclude + '</head>');
+      );
     } else {
-      // Otherwise assume at least a <body> is present and update it to include a new <head>
-      htmlPluginData.html = htmlPluginData.html.replace('<body>', '<head>' + filesToInclude + '</head><body>');
+      compiler.plugin('compilation', (compilation) => {
+        compilation.plugin('html-webpack-plugin-before-html-processing', (htmlPluginData, callback) => {
+          try {
+            callback(null, this.addLinks('v3', compilation, htmlPluginData));
+          } catch (error) {
+            callback(error);
+          }
+        });
+      });
     }
-    cb(null, htmlPluginData);
   }
 }
 
