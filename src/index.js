@@ -82,6 +82,7 @@ class PreloadPlugin {
       const attributes = {
         href,
         rel: options.rel,
+        onload: "this.rel='stylesheet'"
       };
 
       // If we're preloading this resource (as opposed to prefetching),
